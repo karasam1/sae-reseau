@@ -1,88 +1,93 @@
-Voici les 4 règles d'or à vérifier dans tes fichiers :
+# Projet TFTP (Client & Serveur) - RFC 1350
 
-    Le TID (Transfer Identifier) :
+Ce projet implémente un client et un serveur TFTP (Trivial File Transfer Protocol) en langage C, conformes à la norme **RFC 1350**. Il permet le transfert de fichiers (lecture et écriture) via le protocole UDP de manière fiable grâce à un mécanisme de retransmission et de gestion des timeouts.
 
-        Le client envoie à 69, mais reçoit d'un port X. Il doit envoyer tous ses futurs paquets vers X.
+## 🚀 Fonctionnalités
 
-        Si un paquet arrive d'un port Y différent de X, il faut envoyer un paquet d'erreur (Code 5) à Y et continuer le transfert avec X.
+*   **Conformité RFC 1350** : Respect du format des paquets (RRQ, WRQ, DATA, ACK, ERROR).
+*   **Mode Client & Serveur** :
+    *   **Client** : Permet de télécharger (`get`) ou téléverser (`put`) des fichiers vers un serveur TFTP.
+    *   **Serveur** : Serveur itératif capable de gérer, stocker et servir des fichiers depuis un répertoire dédié (`.tftp/`).
+*   **Fiabilité** :
+    *   Gestion des **timeouts** (socket options + boucles de rejeu).
+    *   **Retransmission** automatique des paquets perdus (Max 5 tentatives).
+    *   Gestion du **TID (Transfer Identifier)** pour assurer l'unicité et la sécurité des sessions de transfert.
+    *   Anti-doublons (lutte contre le *Sorcerer's Apprentice Syndrome*).
+*   **Sécurité** :
+    *   Protection contre le **Directory Traversal** (rejet des chemins contenant `..`).
+    *   Vérification stricte de l'origine des paquets (IP et Port).
 
-    La fin de fichier (EOF) :
+## 🛠️ Compilation
 
-        Un transfert se termine toujours par un paquet DATA de moins de 512 octets de données (entre 0 et 511 octets).
+Le projet ne nécessite aucune dépendance externe hors de la bibliothèque standard C et des headers POSIX/BSD (`sys/socket.h`, `arpa/inet.h`, etc.).
 
-        Si ton fichier fait exactement 512 ou 1024 octets, tu dois envoyer un dernier paquet DATA vide (0 octet de données) pour signaler la fin.
+Pour compiler le client et le serveur :
 
-    Le mode "Octet" :
+```bash
+# Compiler le serveur
+gcc server.c -o server
 
-        Ta requête inclut bien la chaîne "octet". C'est parfait, cela signifie "binaire 8-bit".
+# Compiler le client
+gcc client.c -o client
+```
 
-    Décodage des Erreurs :
+## 📖 Utilisation
 
-        Si tu reçois un Opcode 5, tu ne dois pas simplement arrêter, tu dois afficher le message d'erreur contenu dans le paquet pour le debug.
+### 1. Démarrer le Serveur
 
-Résumé des fonctions à ajouter/modifier :
+Le serveur écoute par défaut sur le port **69** (UDP). Notez que l'utilisation du port 69 nécessite généralement des privilèges administrateur (root).
 
-    send_error : Déjà présente dans ton serveur, copie-la dans ton client pour répondre aux paquets venant de mauvais ports.
+```bash
+sudo ./server
+```
+*Le serveur stockera les fichiers reçus et cherchera les fichiers demandés dans le dossier caché `.tftp/` (créé automatiquement).*
 
-    Vérification de sin_port : À ajouter dans chaque boucle recvfrom après le premier échange réussi.
+### 2. Utiliser le Client
 
+La syntaxe d'utilisation du client est la suivante :
 
+```bash
+./client <ip_serveur> <commande> <fichier> [port]
+```
 
+*   **ip_serveur** : L'adresse IP du serveur TFTP (ex: `127.0.0.1`).
+*   **commande** :
+    *   `get` : Télécharger un fichier du serveur.
+    *   `put` : Envoyer un fichier vers le serveur.
+*   **fichier** : Nom du fichier à transférer.
+*   **port** *(optionnel)* : Port du serveur (défaut : 69).
 
+#### Exemples
 
-CLIENT :
-// --- Dans la fonction get() ---
-struct sockaddr_in current_peer; // Pour stocker le TID (port de transfert) du serveur
-int tid_set = 0;
+**Téléchargement (GET) :**
+Récupérer `image.png` depuis le serveur local :
+```bash
+./client 127.0.0.1 get image.png
+```
 
-// ... dans la boucle de réception ...
-n = recvfrom(sockfd, buffer, MAX_BUF, 0, (struct sockaddr *)&peer_addr, &peer_len);
+**Envoi (PUT) :**
+Envoyer `document.txt` vers le serveur :
+```bash
+./client 127.0.0.1 put document.txt
+```
 
-if (n >= 4) {
-    if (!tid_set) {
-        // PREMIER PAQUET REÇU : On fixe le TID
-        memcpy(&current_peer, &peer_addr, peer_len);
-        tid_set = 1;
-    } else {
-        // CONFORMITÉ RFC : Vérifier que le port (TID) n'a pas changé
-        if (peer_addr.sin_port != current_peer.sin_port) {
-            send_error(sockfd, &peer_addr, peer_len, 5, "Unknown TID"); // Erreur 5 : TID inconnu
-            continue; // On ignore ce paquet parasite
-        }
-    }
-    
-    uint16_t block_num = ntohs(*(uint16_t *)(buffer + 2));
-    // GESTION DES DOUBLONS : Si on reçoit un bloc déjà traité, on renvoie juste l'ACK
-    if (block_num == dernier_lock_recu) {
-        char ack[4] = {0, 4, buffer[2], buffer[3]};
-        sendto(sockfd, ack, 4, 0, (struct sockaddr *)&current_peer, peer_len);
-        continue; 
-    }
-    // ... traitement normal du nouveau bloc ...
-}
+**Sur un port spécifique (ex: 8080) :**
+```bash
+./client 192.168.1.50 get data.bin 8080
+```
 
+## 📂 Structure du Projet
 
-SERVER :
-// --- Dans traitement_rrq() ---
-// GESTION DES DOUBLONS (ACK perdu)
-// Si le client renvoie l'ACK du bloc N-1, le serveur doit renvoyer le bloc N.
-// Si le client renvoie l'ACK du bloc N, on passe au bloc N+1.
+*   **`client.c`** : Code source du client. Gère l'analyse des arguments, l'initialisation socket, et les boucles de transfert (machines à états implicites).
+*   **`server.c`** : Code source du serveur. Écoute sur le port principal, puis délègue le traitement RRQ/WRQ à des sockets éphémères dédiées.
+*   **`.tftp/`** : Répertoire de stockage par défaut du serveur (créé à l'exécution).
 
-if (r >= 4) {
-    uint16_t ack_val = ntohs(*(uint16_t *)(ack_buf + 2));
-    if (ack_val == block_num) {
-        ack_recu = 1; // Succès
-    } else if (ack_val == block_num - 1) {
-        // Le client n'a peut-être pas reçu notre bloc DATA, il renvoie l'ancien ACK
-        // On ne fait rien ici, la boucle de retransmission renverra le bloc block_num
-    }
-}
+## ⚠️ Notes Techniques
 
-// --- Dans le main() ---
-// CONFORMITÉ : Envoyer une erreur si l'opcode est inconnu
-uint16_t opcode = ntohs(*(uint16_t *)buffer);
-if (opcode == 1) traitement_rrq(...);
-else if (opcode == 2) traitement_wrq(...);
-else {
-    send_error(server_fd, &client_addr, addr_len, 4, "Illegal TFTP operation");
-}
+*   **Taille de bloc** : Fixée à 512 octets (standard RFC 1350).
+*   **Timeout** : Configuré à 5 secondes avec 5 essais maximum avant abandon.
+*   **Mode** : Le transfert se fait implicitement en mode "octet" (binaire), adapté à tous types de fichiers.
+
+## Auteurs
+
+Projet réalisé dans le cadre de la SAE Réseaux.
