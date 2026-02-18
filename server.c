@@ -7,6 +7,45 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#define MAX_FILES 128
+
+typedef struct {
+    char filename[256];
+    pthread_mutex_t mutex;
+    bool in_use;
+} file_mutex_t;
+
+file_mutex_t file_mutexes[MAX_FILES];
+pthread_mutex_t global_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+file_mutex_t* get_file_mutex(const char* filename) {
+    pthread_mutex_lock(&global_mutex);
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (file_mutexes[i].in_use && strcmp(file_mutexes[i].filename, filename) == 0) {
+            pthread_mutex_unlock(&global_mutex);
+            return &file_mutexes[i];
+        }
+    }
+    // Not found, create new
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (!file_mutexes[i].in_use) {
+            strncpy(file_mutexes[i].filename, filename, 255);
+            file_mutexes[i].filename[255] = '\0';
+            pthread_mutex_init(&file_mutexes[i].mutex, NULL);
+            file_mutexes[i].in_use = true;
+            pthread_mutex_unlock(&global_mutex);
+            return &file_mutexes[i];
+        }
+    }
+    pthread_mutex_unlock(&global_mutex);
+    return NULL;
+}
 
 #define REPOSITORY ".tftp/"
 #define PORT 69
@@ -24,6 +63,28 @@ void send_error(int sockfd, struct sockaddr_in *client_addr, socklen_t addr_len,
     sendto(sockfd, err_packet, len, 0, (struct sockaddr *)client_addr, addr_len);
 }
 
+void* thread_rrq(void* arg) {
+    struct {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len;
+        char fichier[516];
+    } *params = arg;
+    traitement_rrq(&params->client_addr, params->addr_len, params->fichier);
+    free(params);
+    return NULL;
+}
+
+void* thread_wrq(void* arg) {
+    struct {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len;
+        char fichier[516];
+    } *params = arg;
+    traitement_wrq(&params->client_addr, params->addr_len, params->fichier);
+    free(params);
+    return NULL;
+}
+
 void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const char *fichier) {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0); 
     
@@ -31,15 +92,34 @@ void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
     struct timeval tv = {TFTP_TIMEOUT_SEC, 0}; 
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    if (strstr(fichier, "..")) {
-        printf("  [SERVER] Erreur : Tentative d'accès non autorisé '%s'.\n", fichier);
+    // Le paramètre 'fichier' contient: <filename>\0<mode>\0 selon RFC
+    const char *filename = fichier;
+    const char *mode = fichier + strlen(filename) + 1;
+    if (!filename || !mode) {
+        send_error(sockfd, client_addr, addr_len, 4, "Illegal TFTP operation");
+        close(sockfd);
+        return;
+    }
+
+    // Supporter uniquement le mode "octet" pour l'instant
+    if (strcasecmp(mode, "octet") != 0) {
+        printf("  [SERVER] Mode non supporte: %s\n", mode);
+        send_error(sockfd, client_addr, addr_len, 4, "Illegal TFTP operation");
+        close(sockfd);
+        return;
+    }
+
+    if (strstr(filename, "..")) {
+        printf("  [SERVER] Erreur : Tentative d'accès non autorisé '%s'.\n", filename);
         send_error(sockfd, client_addr, addr_len, 2, "Access violation");
         close(sockfd);
         return;
     }
 
     char chemin[256];
-    snprintf(chemin, sizeof(chemin), REPOSITORY "%s", fichier);
+    snprintf(chemin, sizeof(chemin), REPOSITORY "%s", filename);
+    file_mutex_t* mtx = get_file_mutex(filename);
+    if (mtx) pthread_mutex_lock(&mtx->mutex);
     FILE *f = fopen(chemin, "rb");
     
     if (!f) {
@@ -72,7 +152,7 @@ void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
                 perror("sendto");
                 break;
             }
-            printf("  [GET] ACK %d recu ,envoi du bloc %d (%zu octets)...\n", block_num, block_num, read_len);
+                printf("  [GET] Envoi du bloc %d (%zu octets)...\n", block_num, read_len);
 
             ssize_t r = recvfrom(sockfd, ack_buf, 4, 0, (struct sockaddr *)&peer_addr, &peer_len);
             if (r >= 4) {
@@ -103,6 +183,7 @@ void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
 
     printf("  [GET] Transfert de '%s' terminé.\n", fichier);
     fclose(f);
+    if (mtx) pthread_mutex_unlock(&mtx->mutex);
     close(sockfd);
 }
 
@@ -112,6 +193,25 @@ void traitement_wrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
     struct timeval tv = {TFTP_TIMEOUT_SEC, 0};
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    // 'fichier' contient: <filename>\0<mode>\0
+    const char *filename = fichier;
+    const char *mode = fichier + strlen(filename) + 1;
+    if (!filename || !mode) {
+        send_error(sockfd, client_addr, addr_len, 4, "Illegal TFTP operation");
+        close(sockfd);
+        return;
+    }
+
+    // Supporter uniquement le mode "octet" pour l'instant
+    if (strcasecmp(mode, "octet") != 0) {
+        printf("  [SERVER] Mode non supporte: %s\n", mode);
+        send_error(sockfd, client_addr, addr_len, 4, "Illegal TFTP operation");
+        close(sockfd);
+        return;
+    }
+
+    file_mutex_t* mtx = get_file_mutex(filename);
+    if (mtx) pthread_mutex_lock(&mtx->mutex);
     char *buffer_final = NULL;
     size_t taille_totale = 0;
     uint16_t dernier_block_recu = 0;
@@ -123,15 +223,15 @@ void traitement_wrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
 
     char buffer_reception[MAX_BUF];
     ssize_t n;
-    printf("  [PUT] Réception de '%s'...\n", fichier);
+    printf("  [PUT] Réception de '%s'...\n", filename);
 
     struct sockaddr_in peer_addr;
     socklen_t peer_len = sizeof(peer_addr);
     int peer_set = 0;
+    int recu_ok = 0;
 
     do {
         int tentatives = 0;
-        int recu_ok = 0;
 
         while (tentatives < TFTP_MAX_ESSAI && !recu_ok) {
             ssize_t r = recvfrom(sockfd, buffer_reception, MAX_BUF, 0, (struct sockaddr *)&peer_addr, &peer_len);
@@ -194,26 +294,35 @@ void traitement_wrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
 
     } while (n == 516);
 
-    // Sauvegarde identique à ton code
-    mkdir(REPOSITORY, 0777);
-    
-    if (strstr(fichier, "..")) {
-         printf("  [SERVER] Erreur : Tentative d'accès non autorisé '%s'.\n", fichier);
-         // Note: socket déjà fermée à la fin de la fonction, mais on ne doit pas écrire.
-         // cleanup
-         free(buffer_final);
-         close(sockfd);
-         return;
+    if (!recu_ok) {
+        free(buffer_final);
+        if (mtx) pthread_mutex_unlock(&mtx->mutex);
+        close(sockfd);
+        return;
     }
 
+    if (strstr(filename, "..")) {
+        printf("  [SERVER] Erreur : Tentative d'accès non autorisé '%s'.\n", filename);
+        free(buffer_final);
+        if (mtx) pthread_mutex_unlock(&mtx->mutex);
+        close(sockfd);
+        return;
+    }
+
+    mkdir(REPOSITORY, 0777);
+
     char chemin[256];
-    snprintf(chemin, sizeof(chemin), REPOSITORY "%s", fichier);
+    snprintf(chemin, sizeof(chemin), REPOSITORY "%s", filename);
     FILE *f = fopen(chemin, "wb");
     if (f) { 
         fwrite(buffer_final, 1, taille_totale, f); 
-        printf("  [PUT] Transfert de '%s' terminé.\n", fichier);
-        fclose(f); }
+        printf("  [PUT] Transfert de '%s' terminé.\n", filename);
+        fclose(f); 
+    } else {
+        printf("  [SERVER] Erreur : Impossible d'écrire le fichier '%s'.\n", chemin);
+    }
     free(buffer_final);
+    if (mtx) pthread_mutex_unlock(&mtx->mutex);
     close(sockfd);
 }
 
@@ -222,8 +331,6 @@ int main() {
     struct sockaddr_in server_addr, client_addr;
     char buffer[MAX_BUF];
     socklen_t addr_len = sizeof(client_addr);
-
-
 
     server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     memset(&server_addr, 0, sizeof(server_addr));
@@ -239,12 +346,20 @@ int main() {
     printf("[SERVER] En attente sur le port %d...\n", PORT);
     while (1) {
         ssize_t n = recvfrom(server_fd, buffer, MAX_BUF, 0, (struct sockaddr *)&client_addr, &addr_len);
-        if (n < 4) continue; // tftp min 4 octets(2 opcode + 1+ nom fichier +1 + mode +1)
+        if (n < 4) continue;
         uint16_t opcode = ntohs(*(uint16_t *)buffer);
-        if (opcode == 1)
-            traitement_rrq(&client_addr, addr_len, buffer + 2);
-        else if 
-            (opcode == 2) traitement_wrq(&client_addr, addr_len, buffer + 2);
+        pthread_t tid;
+        if (opcode == 1 || opcode == 2) {
+            void* params = malloc(sizeof(struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}));
+            memcpy(&((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}*)params)->client_addr, &client_addr, sizeof(client_addr));
+            ((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}*)params)->addr_len = addr_len;
+            memcpy(((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}*)params)->fichier, buffer + 2, 516);
+            if (opcode == 1)
+                pthread_create(&tid, NULL, thread_rrq, params);
+            else
+                pthread_create(&tid, NULL, thread_wrq, params);
+            pthread_detach(tid);
+        }
     }
     return 0;
 }
