@@ -24,8 +24,8 @@
 
 typedef enum {
     STATE_NONE,
-    STATE_RRQ, // Server sending data
-    STATE_WRQ  // Server receiving data
+    STATE_RRQ,
+    STATE_WRQ
 } ClientState;
 
 typedef struct {
@@ -37,8 +37,8 @@ typedef struct {
     char filename[256];
     FILE *fp;
     
-    uint16_t block_num;      // Next block to send (RRQ) or expected block (WRQ)
-    char buffer[MAX_BUF];    // Data buffer
+    uint16_t block_num;      // Bloc suivant à envoyer (RRQ) ou bloc attendu (WRQ)
+    char buffer[MAX_BUF];
     int buffer_len;
     
     time_t last_activity;
@@ -55,7 +55,7 @@ typedef struct {
 FileLock file_locks[MAX_FILES];
 ClientContext clients[MAX_CLIENTS];
 
-// --- Helpers ---
+// --- Helpers (aides) ---
 
 void init_globals() {
     for (int i = 0; i < MAX_FILES; i++) file_locks[i].in_use = false;
@@ -111,7 +111,7 @@ void cleanup_client(int index) {
     clients[index].active = false;
 }
 
-// --- Logic ---
+// --- Logique ---
 
 void handle_new_request(int server_fd) {
     struct sockaddr_in client_addr;
@@ -123,7 +123,7 @@ void handle_new_request(int server_fd) {
     
     uint16_t opcode = ntohs(*(uint16_t*)buffer);
     
-    if (opcode != 1 && opcode != 2) return; // Only RRQ/WRQ
+    if (opcode != 1 && opcode != 2) return; // Seulement RRQ/WRQ
 
     // Validate packet: Opcode | Filename | 0 | Mode | 0
     char *filename = buffer + 2;
@@ -217,7 +217,7 @@ void handle_new_request(int server_fd) {
 
     } else { // WRQ (Write Request)
         c->state = STATE_WRQ;
-        c->fp = NULL; // Will be opened when first DATA block arrives
+        c->fp = NULL; // Will be opened en first DATA block arrives
         c->block_num = 0;
         
         // Send ACK 0
@@ -395,7 +395,7 @@ int main() {
                 if (clients[i].sockfd > max_fd) max_fd = clients[i].sockfd;
             }
         }
-        struct timeval tv = {1, 0}; // 1 sec timeout for loop to check retransmits
+        struct timeval tv = {1, 0};
         int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
 
         if (activity < 0 && errno != EINTR) {

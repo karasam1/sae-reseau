@@ -5,6 +5,9 @@ SERVER_IP="127.0.0.1"
 PORT=69
 REPO=".tftp"
 CLIENT_BIN="./client"
+SERVER_BIN="./server_select"
+CLIENT_SRC="client.c"
+SERVER_SRC="server_select.c"
 
 # Couleurs pour la lisibilité
 VERT='\033[0;32m'
@@ -14,26 +17,52 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${CYAN}==========================================================${NC}"
-echo -e "${CYAN}   PROTOCOLE DE TEST : MULTIPLEXAGE ET EXCLUSION MUTUELLE ${NC}"
+echo -e "${CYAN}    COMPILATION ET PROTOCOLE DE TEST : SERVER_SELECT     ${NC}"
 echo -e "${CYAN}==========================================================${NC}"
 
-# 1. Nettoyage et préparation
-echo -e "\n${JAUNE}[1/4] Préparation de l'environnement...${NC}"
-rm -rf $REPO && mkdir -p $REPO
-rm -f archivo_A.txt archivo_B.txt
+# 1. Compilation automatique
+echo -e "\n${JAUNE}[1/5] Vérification et Compilation des sources...${NC}"
 
-# Création de fichiers sources avec un contenu unique
-echo "CONTENU_TEST_A_$(date +%s)" > "$REPO/archivo_A.txt"
-echo "CONTENU_TEST_B_$(date +%s)" > "$REPO/archivo_B.txt"
+# Fonction de compilation pour éviter la répétition
+compile_file() {
+    local src=$1
+    local bin=$2
+    if [ -f "$src" ]; then
+        echo -n "Compilation de $src... "
+        gcc -Wall "$src" -o "$bin"
+        if [ $? -eq 0 ]; then
+            echo -e "${VERT}SUCCÈS${NC}"
+        else
+            echo -e "${ROUGE}ERREUR DE COMPILATION${NC}"
+            exit 1
+        fi
+    else
+        echo -e "${ROUGE}ERREUR : Fichier source $src introuvable.${NC}"
+        exit 1
+    fi
+}
 
-if [ ! -f "$CLIENT_BIN" ]; then
-    echo -e "${ROUGE}[ERREUR] Le binaire '$CLIENT_BIN' est introuvable. Tapez 'make'.${NC}"
-    exit 1
+compile_file "$SERVER_SRC" "$SERVER_BIN"
+compile_file "$CLIENT_SRC" "$CLIENT_BIN"
+
+# 2. Préparation et Génération des ressources
+echo -e "\n${JAUNE}[2/5] Préparation de l'environnement .tftp/...${NC}"
+
+if [ ! -d "$REPO" ]; then
+    mkdir -p "$REPO"
 fi
 
-# 2. Test de Parallélisme (Multiplexage)
-echo -e "\n${JAUNE}[2/4] Test : Téléchargement simultané (Select/Poll)${NC}"
-echo -e "Lancement de deux téléchargements en parallèle..."
+# Nettoyage des anciennes traces
+rm -f archivo_A.txt archivo_B.txt
+
+# Génération des fichiers de test
+echo "CONTENU_UNIQUE_A_$(date +%s)" > "$REPO/archivo_A.txt"
+echo "CONTENU_UNIQUE_B_$(date +%s)" > "$REPO/archivo_B.txt"
+echo -e "${VERT}[OK] Environnement prêt.${NC}"
+
+# 3. Test de Parallélisme (Multiplexage)
+echo -e "\n${JAUNE}[3/5] Test : Téléchargements simultanés...${NC}"
+echo -e "Note : Assurez-vous que le serveur est déjà lancé dans un autre terminal."
 
 $CLIENT_BIN $SERVER_IP get archivo_A.txt $PORT > /dev/null &
 PID1=$!
@@ -41,46 +70,47 @@ $CLIENT_BIN $SERVER_IP get archivo_B.txt $PORT > /dev/null &
 PID2=$!
 
 wait $PID1 $PID2
-echo -e "${VERT}[OK] Les processus parallèles sont terminés.${NC}"
+echo -e "${VERT}[OK] Les requêtes parallèles ont été traitées.${NC}"
 
-# 3. Test d'Exclusion Mutuelle (Verrouillage/Lock)
-echo -e "\n${JAUNE}[3/4] Test : Verrouillage de fichier (Même ressource)${NC}"
-echo -e "Étape A: Le Client 1 bloque 'archivo_A.txt'..."
-# On simule un client qui prend un peu de temps (si possible) ou on lance juste
+# 4. Test d'Exclusion Mutuelle (Lock)
+echo -e "\n${JAUNE}[4/5] Test : Verrouillage (Accès concurrent sur archivo_A.txt)${NC}"
+
 $CLIENT_BIN $SERVER_IP get archivo_A.txt $PORT > /dev/null &
 PID_LOCK=$!
 
-sleep 0.3 # Temps pour que le serveur traite la première requête
+sleep 0.2 # Pause pour laisser le temps au serveur de verrouiller
 
-echo -e "Étape B: Le Client 2 tente d'accéder au même fichier..."
-# On capture le message d'erreur spécifique
-RESULT_ERR=$($CLIENT_BIN $SERVER_IP get archivo_A.txt $PORT 2>&1)
+echo -e "Tentative du Client 2 (devrait échouer)..."
+ERREUR_MSG=$($CLIENT_BIN $SERVER_IP get archivo_A.txt $PORT 2>&1)
 
-if [[ $RESULT_ERR == *"File busy"* ]] || [[ $RESULT_ERR == *"Error"* ]]; then
-    echo -e "${VERT}[SUCCÈS] Le serveur a bien rejeté la deuxième requête (File Busy).${NC}"
+if [[ $ERREUR_MSG == *"busy"* ]] || [[ $ERREUR_MSG == *"Error"* ]] || [[ $ERREUR_MSG == *"lock"* ]]; then
+    echo -e "${VERT}[SUCCÈS] Le serveur a bien refusé l'accès concurrent.${NC}"
 else
-    echo -e "${ROUGE}[ATTENTION] Le serveur n'a pas renvoyé d'erreur de verrouillage.${NC}"
+    echo -e "${ROUGE}[ALERTE] Le serveur n'a pas appliqué le verrouillage.${NC}"
 fi
 
 wait $PID_LOCK
 
-# 4. Vérification de l'intégrité (Comparaison réelle)
-echo -e "\n${JAUNE}[4/4] Vérification de l'intégrité des données...${NC}"
-INTEGRITY=true
+# 5. Vérification finale et nettoyage
+echo -e "\n${JAUNE}[5/5] Vérification de l'intégrité...${NC}"
+TEST_FINAL=true
 
-for file in "archivo_A.txt" "archivo_B.txt"; do
-    if diff "$REPO/$file" "$file" > /dev/null; then
-        echo -e "${VERT}[OK] $file : Identique à l'original.${NC}"
+for f in "archivo_A.txt" "archivo_B.txt"; do
+    if [ -f "$f" ] && diff "$REPO/$f" "$f" > /dev/null; then
+        echo -e "${VERT}[OK] $f : Reçu sans corruption.${NC}"
     else
-        echo -e "${ROUGE}[FAIL] $file : Corruption ou fichier manquant.${NC}"
-        INTEGRITY=false
+        echo -e "${ROUGE}[ÉCHEC] $f : Erreur de réception.${NC}"
+        TEST_FINAL=false
     fi
 done
 
 echo -e "\n${CYAN}==========================================================${NC}"
-if [ "$INTEGRITY" = true ]; then
-    echo -e "${VERT}RÉSULTAT FINAL : TEST RÉUSSI${NC}"
+if [ "$TEST_FINAL" = true ]; then
+    echo -e "${VERT}RÉSULTAT DU TEST : RÉUSSI (SUCCESS)${NC}"
+    # Nettoyage automatique des fichiers téléchargés
+    rm archivo_A.txt archivo_B.txt
+    echo -e "${NC}Fichiers de test nettoyés.${NC}"
 else
-    echo -e "${ROUGE}RÉSULTAT FINAL : TEST ÉCHOUÉ${NC}"
+    echo -e "${ROUGE}RÉSULTAT DU TEST : ÉCHOUÉ (FAILED)${NC}"
 fi
 echo -e "${CYAN}==========================================================${NC}"
