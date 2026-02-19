@@ -107,7 +107,6 @@ void cleanup_client(int index) {
         unlock_file(clients[index].filename);
         printf("[SELECT] Client %d: Closed transfer for '%s'\n", index, clients[index].filename);
     }
-    
     clients[index].active = false;
 }
 
@@ -151,7 +150,7 @@ void handle_new_request(int server_fd) {
          return;
     }
     
-    // Find free client slot
+    // Trouver un creneaux client libre
     int cid = -1;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].active) {
@@ -165,14 +164,14 @@ void handle_new_request(int server_fd) {
         return;
     }
     
-    // Create new socket for this client
+    // Créer un nouveau socket pour ce client
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("socket");
         return;
     }
 
-    // Try to lock file
+    // Essayer de verrouiller le fichier demandé
     if (!lock_file(filename)) {
         printf("[SELECT] File '%s' busy, rejecting.\n", filename);
         send_error(sockfd, &client_addr, addr_len, 0, "File busy"); 
@@ -180,14 +179,14 @@ void handle_new_request(int server_fd) {
         return;
     }
     
-    // Initialize Client Context
+    // Initialiser le contexte client
     ClientContext *c = &clients[cid];
     c->active = true;
     c->sockfd = sockfd;
     c->client_addr = client_addr;
     c->addr_len = addr_len;
     strncpy(c->filename, filename, 255);
-    c->filename[255] = '\0'; // Ensure null-terminated even if long
+    c->filename[255] = '\0'; // Assurer que la terminaison est nulle même si elle est longue
     c->last_activity = time(NULL);
     c->retries = 0;
     
@@ -204,7 +203,7 @@ void handle_new_request(int server_fd) {
         }
         c->block_num = 1;
         
-        // Prepare first block
+        // Préparer le premier bloc de donée
         uint16_t op = htons(3);
         uint16_t blk = htons(1);
         memcpy(c->buffer, &op, 2);
@@ -217,10 +216,10 @@ void handle_new_request(int server_fd) {
 
     } else { // WRQ (Write Request)
         c->state = STATE_WRQ;
-        c->fp = NULL; // Will be opened en first DATA block arrives
+        c->fp = NULL;
         c->block_num = 0;
         
-        // Send ACK 0
+        // Envoyer ACK 0
         uint16_t op = htons(4);
         uint16_t blk = htons(0);
         char ack[4];
@@ -240,30 +239,30 @@ void handle_client_io(int index) {
     ssize_t n = recvfrom(c->sockfd, recv_buf, MAX_BUF, 0, (struct sockaddr*)&sender, &slen);
     if (n < 4) return;
     
-    // Verify Sender (TID)
+    // Verrifier sender (TID)
     if (sender.sin_addr.s_addr != c->client_addr.sin_addr.s_addr || sender.sin_port != c->client_addr.sin_port) {
         send_error(c->sockfd, &sender, slen, 5, "Unknown transfer ID");
         return;
     }
     
     c->last_activity = time(NULL);
-    c->retries = 0; // Reset retries on successful packet
+    c->retries = 0;
     
     uint16_t opcode = ntohs(*(uint16_t*)recv_buf);
     uint16_t block = ntohs(*(uint16_t*)(recv_buf+2));
     
     if (c->state == STATE_RRQ) {
-        // Expecting ACK for c->block_num
+        // Attente d'accusé de réception pour le bloc actuel
         if (opcode == 4 && block == c->block_num) {
-            // ACK received for current block.
-            // Check if it was the last block (buffer length < 516)
+            // Accusé de reception reçu pour le bloc actuel.
+            // Vérifier si c'etait le dernier bloc (moins de 512 bytes de données)
             if (c->buffer_len < 516) {
                 printf("[SELECT] Client %d: Transfer complete.\n", index);
                 cleanup_client(index);
                 return;
             }
             
-            // Read next block
+            // Envoyer le bloc suivant
             c->block_num++;
             uint16_t op = htons(3);
             uint16_t blk = htons(c->block_num);
@@ -275,16 +274,13 @@ void handle_client_io(int index) {
             sendto(c->sockfd, c->buffer, c->buffer_len, 0, (struct sockaddr*)&c->client_addr, c->addr_len);
         }
         else if (opcode == 4 && block == c->block_num - 1) {
-             // Duplicate ACK, ignore or retransmit? 
-             // Logic says if we receive dup ACK, maybe our data got lost?
-             // Usually we just wait for timeout to retransmit.
         }
         
     } else if (c->state == STATE_WRQ) {
-        // Expecting DATA with block == c->block_num + 1
+        // Données attendues avec le bloc == c->block_num + 1
         if (opcode == 3) {
             if (block == c->block_num + 1) {
-                // First DATA block - open file
+                // Premier bloc de données - ouvrir le fichier 
                 if (!c->fp) {
                     char path[512];
                     snprintf(path, sizeof(path), REPOSITORY "%s", c->filename);
@@ -296,11 +292,11 @@ void handle_client_io(int index) {
                     }
                 }
                 
-                // Good block
+                // bon bloc reçu, écrire les données
                 fwrite(recv_buf+4, 1, n-4, c->fp);
                 c->block_num++;
                 
-                // Send ACK
+                //  Envoyer ACK pour ce bloc
                 uint16_t op = htons(4);
                 uint16_t blk = htons(c->block_num);
                 char ack[4];
@@ -313,7 +309,7 @@ void handle_client_io(int index) {
                     cleanup_client(index);
                 }
             } else if (block == c->block_num) {
-                // Duplicate Data, re-send ACK for prev block
+                // Données dupliquées, veuillez renvoyer l'accusé de réception pour le bloc précédent.
                 uint16_t op = htons(4);
                 uint16_t blk = htons(c->block_num);
                 char ack[4];
@@ -336,12 +332,12 @@ void check_timeouts() {
                     cleanup_client(i);
                 } else {
                     printf("[SELECT] Client %d timeout. Retrying (%d/%d)...\n", i, clients[i].retries, MAX_RETRIES);
-                    // Retransmit logic
+                    // logique de retransmission
                     if (clients[i].state == STATE_RRQ) {
-                         // Resend current DATA buffer
+                         // Renvoyer le tampon de données actuel (dernier bloc envoyé)
                          sendto(clients[i].sockfd, clients[i].buffer, clients[i].buffer_len, 0, (struct sockaddr*)&clients[i].client_addr, clients[i].addr_len);
                     } else if (clients[i].state == STATE_WRQ) {
-                        // Resend last ACK
+                        // Renvoyer le dernier accusé de réception
                         uint16_t op = htons(4);
                         uint16_t blk = htons(clients[i].block_num);
                         char ack[4];
@@ -356,26 +352,29 @@ void check_timeouts() {
     }
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     int server_fd;
     struct sockaddr_in server_addr;
+
+    int port = PORT;
     
     init_globals();
     mkdir(REPOSITORY, 0777);
 
+    if (argc > 1) {
+        port = atoi(argv[1]);
+    }
+
     server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
     
-    // Non-blocking server socket? Or just use select.
-    // Making it non-blocking shouldn't strictly be necessary if select says it's ready, 
-    // but good practice.
     int flags = fcntl(server_fd, F_GETFL, 0);
     fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    server_addr.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
