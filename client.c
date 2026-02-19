@@ -7,7 +7,6 @@
 #include <errno.h>
 #include <sys/time.h>
 
-
 #define PORT 69
 #define MAX_BUF 516
 #define TFTP_TIMEOUT_SEC 5
@@ -67,6 +66,14 @@ void send_request(int sockfd, struct sockaddr_in *server_addr, uint16_t opcode_v
 int get(int sockfd, struct sockaddr_in *server_addr, const char *fichier) {
     // Configurer le timeout sur la socket
     struct timeval tv = {TFTP_TIMEOUT_SEC, 0};
+    
+    // Appel à une fonction système (System Call) pour configurer le timeout de réception sur la socket.
+    //  sockfd : Identificateur du socket du client
+    //  SOL_SOCKET : Cela indique que l'option à modifier se situe au niveau général du <<socket>>; cela ne spécifie pas de protocole TCP or UDP.
+    //  SO_RCVTIMEO :   Option de socket pour définir le délai d'attente pour les opérations de réception (recvfrom).
+    //                  Cela signifie (Receive Timeout - Delai d'attente de réception)
+    //  &tv : Pointeur vers la structure timeval
+    //  
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     char *buffer_final = NULL;
@@ -90,6 +97,8 @@ int get(int sockfd, struct sockaddr_in *server_addr, const char *fichier) {
         int recu_ok = 0;
 
         while (tentatives < TFTP_MAX_RETRIES && !recu_ok) {
+            //  recvfrom : Fonction système pour recevoir des données sur une socket UDP
+            //  Si le serveur répond, on reçoit un paquet et on vérifie son contenu.
             n = recvfrom(sockfd, buffer, MAX_BUF, 0, (struct sockaddr *)&peer_addr, &peer_len);
 
             if (n >= 4) {
@@ -114,15 +123,15 @@ int get(int sockfd, struct sockaddr_in *server_addr, const char *fichier) {
                 }
             } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 tentatives++;
-                printf("[TIMEOUT] Tentative %d/%d... Renvoi du dernier message.\n", tentatives, TFTP_MAX_RETRIES);
+                printf("[TIMEOUT] Tentative %d/%d ... Renvoi du dernier message.\n", tentatives, TFTP_MAX_RETRIES);
                 if (dernier_lock_recu == 0) {
-                    send_request(sockfd, server_addr, 1, fichier);
+                    send_request(sockfd, server_addr, 1, fichier); // Operation Code 1 = RRQ (Read Request)
                 } else {
                     if (peer_set) {
                         uint16_t blk_net = htons(dernier_lock_recu);
                         char ack_retry[4] = {0, 4, ((char*)&blk_net)[0], ((char*)&blk_net)[1]};
                         peer_addr.sin_port = server_tid;
-                        if (sendto(sockfd, ack_retry, 4, 0, (struct sockaddr *)&peer_addr, peer_len) < 0) {
+                        if (sendto(sockfd, ack_retry, 4, 0, (struct sockaddr *)& peer_addr, peer_len) < 0) {
                             perror("sendto");
                             break;
                         }
@@ -228,7 +237,7 @@ int put(int sockfd, struct sockaddr_in *server_addr, const char *fichier) {
     }
     if (!recu_ok) { free(full_data); return -1; }
 
-    peer_addr.sin_port = server_addr->sin_port;
+    // peer_addr already contains the correct TID from ACK 0 response - do NOT overwrite
 
 
     // Phase 2 : Envoi des blocs DATA avec timeout/retries
@@ -366,10 +375,10 @@ int main(int argc, char const *argv[]) {
     
     // User requested syntax: ./client <ip> <get|put> <file> <port>
     // Argv mapping:
-    // argv[1]: ip
-    // argv[2]: get|put
-    // argv[3]: fichier
-    // argv[4]: port (optional)
+    //   argv[1]: ip
+    //   argv[2]: get|put
+    //   argv[3]: fichier
+    //   argv[4]: port (optional) (default 69)
 
     const char *ip = argv[1];
     const char *cmd = argv[2];
@@ -384,7 +393,7 @@ int main(int argc, char const *argv[]) {
     if (strcasecmp(cmd, "get") == 0) type = 1;
     else if (strcasecmp(cmd, "put") == 0) type = 2;
     else {
-        printf("Error: Invalid command '%s'. Use 'get' or 'put'.\n", cmd);
+        printf("Erreur: Commande invalide '%s'. Utiliser 'get' ou 'put'.\n", cmd);
         return 1;
     }
 
@@ -398,9 +407,13 @@ int main(int argc, char const *argv[]) {
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
+
+    // htons : Host To Network Short
+    // Convertit le port de l'ordre d'octets de l'hôte à l'ordre d'octects de réseau (big-endian).
+    server_addr.sin_port = htons(port); 
+
     if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
-        printf("Error: Invalid IP address '%s'\n", ip);
+        printf("Erreur: Adresse IP invalide '%s'\n", ip);
         close(client_fd);
         return 1;
     }

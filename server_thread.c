@@ -70,7 +70,7 @@ void* thread_rrq(void* arg) {
     struct {
         struct sockaddr_in client_addr;
         socklen_t addr_len;
-        char fichier[516];
+        char fichier[MAX_BUF];
     } *params = arg;
     traitement_rrq(&params->client_addr, params->addr_len, params->fichier);
     free(params);
@@ -81,7 +81,7 @@ void* thread_wrq(void* arg) {
     struct {
         struct sockaddr_in client_addr;
         socklen_t addr_len;
-        char fichier[516];
+        char fichier[MAX_BUF];
     } *params = arg;
     traitement_wrq(&params->client_addr, params->addr_len, params->fichier);
     free(params);
@@ -90,6 +90,7 @@ void* thread_wrq(void* arg) {
 
 void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const char *fichier) {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0); 
+    
     if (sockfd < 0) {
         perror("socket");
         return;
@@ -101,9 +102,9 @@ void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
     const char *filename = fichier;
     const char *mode = fichier + strlen(filename) + 1;
 
-    // Basic filename checks
+    // Vérifications de base des noms de fichiers
     if (strstr(filename, "..")) {
-        send_error(sockfd, client_addr, addr_len, 2, "Access violation");
+        send_error(sockfd, client_addr, addr_len, 2, "Violation d'accès");
         close(sockfd);
         return;
     }
@@ -115,9 +116,10 @@ void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
     if (mtx) pthread_mutex_lock(&mtx->mutex);
     
     FILE *f = fopen(chemin, "rb");
+
     if (!f) {
-        if (mtx) pthread_mutex_unlock(&mtx->mutex); // Don't forget to unlock!
-        send_error(sockfd, client_addr, addr_len, 1, "File not found");
+        if (mtx) pthread_mutex_unlock(&mtx->mutex);
+        send_error(sockfd, client_addr, addr_len, 1, "Fichier non trouvé");
         close(sockfd);
         return;
     }
@@ -130,8 +132,10 @@ void traitement_rrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
     do {
         uint16_t opcode = htons(3);
         uint16_t block = htons(block_num);
+        
         memcpy(buffer, &opcode, 2);
         memcpy(buffer + 2, &block, 2);
+        
         read_len = fread(buffer + 4, 1, 512, f);
 
         int tentatives = 0;
@@ -270,7 +274,7 @@ void traitement_wrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
         memcpy(new_ack + 2, &ack_blk, 2);
         sendto(sockfd, new_ack, 4, 0, (struct sockaddr *)&peer_addr, peer_len);
 
-    } while (n == 516);
+    } while (n == MAX_BUF);
 
     if (!recu_ok) {
         free(buffer_final);
@@ -307,13 +311,16 @@ void traitement_wrq(struct sockaddr_in *client_addr, socklen_t addr_len, const c
 
 int main() {
     int server_fd;
-    struct sockaddr_in server_addr, client_addr;
+    
+    struct sockaddr_in server_addr;
+    struct sockaddr_in client_addr;
+
     char buffer[MAX_BUF];
     socklen_t addr_len = sizeof(client_addr);
 
     server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (server_fd < 0) {
-        perror("socket");
+        perror("Socket error");
         return 1;
     }
 
@@ -332,28 +339,29 @@ int main() {
         ssize_t n = recvfrom(server_fd, buffer, MAX_BUF, 0, (struct sockaddr *)&client_addr, &addr_len);
         if (n < 4) continue;
         
-        uint16_t opcode = ntohs(*(uint16_t *)buffer);
+        uint16_t opcode = ntohs(*(uint16_t *)buffer);   //  (nhtons : Network to Host Short)
+                                                        //  16 bits, convertit de l'ordre réseau (big-endian) à l'ordre hôte (endianness de la machine)       
         pthread_t tid;
         
         if (opcode == 1 || opcode == 2) {
-            // Validate packet structure: Opcode | Filename | 0 | Mode | 0
-            // Ensure filename and mode are null-terminated within buffer
+            //  Valider la structure du paquet: Opcode | Filename | 0 | Mode | 0
+            //  Le nom du fichier et le MODE se terminent par un caractère nul dans le tampon
             char *filename = buffer + 2;
             char *mode = NULL;
             char *end = buffer + n;
             
-            // Check for filename null terminator
+            //  Vérifier la présence d'un caractère nul de fin de nom du fichier
             char *p = filename;
             while (p < end && *p) p++;
             if (p >= end - 1) { 
-                // formatted poorly or missing mode
-                 const char *err = "Malformed packet";
-                 send_error(server_fd, &client_addr, addr_len, 4, err); // 4 = Illegal TFTP operation
-                 continue; 
+                //  MODE mal formaté ou manquant
+                const char *err = "Malformed packet";
+                send_error(server_fd, &client_addr, addr_len, 4, err); // 4 = Illegal TFTP operation
+                continue; 
             }
             
             mode = p + 1;
-            // Check for mode null terminator
+            //  Vérifier le terminateur nul du MODE
             p = mode;
             while (p < end && *p) p++;
             if (p >= end) {
@@ -369,25 +377,31 @@ int main() {
                  continue;
             }
 
-            // Allocate memory for thread arguments
-            void* params = malloc(sizeof(struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}));
+            // Allouer de la memoire pour les arguments du thread
+            void* params = malloc(sizeof(
+                struct {
+                    struct sockaddr_in client_addr; 
+                    socklen_t addr_len; 
+                    char fichier[MAX_BUF];
+                }
+            ));
             if (!params) {
                 perror("malloc");
-                continue;
+                continue; 
             }
             
-            memcpy(&((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}*)params)->client_addr, &client_addr, sizeof(client_addr));
-            ((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}*)params)->addr_len = addr_len;
+            memcpy(&((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[MAX_BUF];}*)params)->client_addr, &client_addr, sizeof(client_addr));
+            ((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[MAX_BUF];}*)params)->addr_len = addr_len;
             
-            // Safe copy of filename+0+mode+0 to buffer (max 516)
+            // Copie sécurisée de FILENAME + 0 + MODE + 0 dans le tampon (max MAX_BUF)
             // We already validated format, but let's be safe.
             // The logic in thread function uses: filename = fichier; mode = fichier + strlen + 1;
             // So copying the raw buffer from offset 2 is fine, as validated above.
             size_t data_len = (p + 1) - (buffer + 2);
-            if (data_len > 516) data_len = 516; // Should not happen given MAX_BUF=516 and headers
+            if (data_len > MAX_BUF) data_len = MAX_BUF; // Should not happen given MAX_BUF=MAX_BUF and headers
             
-            memset(((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}*)params)->fichier, 0, 516);
-            memcpy(((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[516];}*)params)->fichier, buffer + 2, data_len);
+            memset(((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[MAX_BUF];}*)params)->fichier, 0, MAX_BUF);
+            memcpy(((struct {struct sockaddr_in client_addr; socklen_t addr_len; char fichier[MAX_BUF];}*)params)->fichier, buffer + 2, data_len);
 
             if (opcode == 1)
                 pthread_create(&tid, NULL, thread_rrq, params);

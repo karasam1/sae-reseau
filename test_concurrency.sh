@@ -13,14 +13,13 @@ NC='\033[0m'
 
 echo -e "${CYAN}--- Pruebas de Concurrencia TFTP ---${NC}"
 
-# 1. Crear archivos de prueba (10MB)
+# 1. Create test files (10MB)
 echo -e "${YELLOW}[INFO] Generando archivos de prueba de 20MB...${NC}"
 mkdir -p $DIR
 dd if=/dev/urandom of=$DIR/file_A.bin bs=1M count=20 status=none
 dd if=/dev/urandom of=$DIR/file_B.bin bs=1M count=20 status=none
 
-# 2. Prueba de Paralelismo Real (Archivos Diferentes)
-# Deberían descargarse al mismo tiempo si los hilos funcionan
+# 2. Test of real parallelism (Differents files)
 echo -e "\n${GREEN}[TEST 1] Paralelismo Real (Archivos Diferentes)${NC}"
 echo "Iniciando Cliente 1 (file_A.bin)..."
 ./client $SERVER_IP get file_A.bin $PORT &
