@@ -1,0 +1,13 @@
+[SERVER-SELECT] Listening on port 69...
+[SELECT] Client 0: Started RRQ for 'archivo_A.txt'
+[SELECT] Client 1: Started RRQ for 'archivo_B.txt'
+[SELECT] Client 1: Transfer complete.
+[SELECT] Client 1: Closed transfer for 'archivo_B.txt'
+[SELECT] Client 0: Transfer complete.
+[SELECT] Client 0: Closed transfer for 'archivo_A.txt'
+[SELECT] Client 0: Started RRQ for 'archivo_A.txt'
+[SELECT] Client 0: Transfer complete.
+[SELECT] Client 0: Closed transfer for 'archivo_A.txt'
+[SELECT] Client 0: Started RRQ for 'archivo_A.txt'
+[SELECT] Client 0: Transfer complete.
+[SELECT] Client 0: Closed transfer for 'archivo_A.txt'

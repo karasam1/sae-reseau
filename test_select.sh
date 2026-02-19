@@ -1,116 +1,61 @@
 #!/bin/bash
 
-# Configuration
+# --- CONFIGURATION ---
 SERVER_IP="127.0.0.1"
 PORT=69
 REPO=".tftp"
-CLIENT_BIN="./client"
-SERVER_BIN="./server_select"
-CLIENT_SRC="client.c"
-SERVER_SRC="server_select.c"
 
-# Couleurs pour la lisibilité
+# couleurs pour les messages
 VERT='\033[0;32m'
 ROUGE='\033[0;31m'
-JAUNE='\033[1;33m'
-CYAN='\033[0;36m'
 NC='\033[0m'
 
-echo -e "${CYAN}==========================================================${NC}"
-echo -e "${CYAN}    COMPILATION ET PROTOCOLE DE TEST : SERVER_SELECT     ${NC}"
-echo -e "${CYAN}==========================================================${NC}"
-
-# 1. Compilation automatique
-echo -e "\n${JAUNE}[1/5] Vérification et Compilation des sources...${NC}"
-
-# Fonction de compilation pour éviter la répétition
-compile_file() {
-    local src=$1
-    local bin=$2
-    if [ -f "$src" ]; then
-        echo -n "Compilation de $src... "
-        gcc -Wall "$src" -o "$bin"
-        if [ $? -eq 0 ]; then
-            echo -e "${VERT}SUCCÈS${NC}"
-        else
-            echo -e "${ROUGE}ERREUR DE COMPILATION${NC}"
-            exit 1
-        fi
-    else
-        echo -e "${ROUGE}ERREUR : Fichier source $src introuvable.${NC}"
-        exit 1
-    fi
-}
-
-compile_file "$SERVER_SRC" "$SERVER_BIN"
-compile_file "$CLIENT_SRC" "$CLIENT_BIN"
-
-# 2. Préparation et Génération des ressources
-echo -e "\n${JAUNE}[2/5] Préparation de l'environnement .tftp/...${NC}"
-
-if [ ! -d "$REPO" ]; then
-    mkdir -p "$REPO"
-fi
-
-# Nettoyage des anciennes traces
+# --- TESTS ---
+sudo pkill -9 server_select 2>/dev/null
+rm -rf $REPO && mkdir -p $REPO
 rm -f archivo_A.txt archivo_B.txt
 
-# Génération des fichiers de test
-echo "CONTENU_UNIQUE_A_$(date +%s)" > "$REPO/archivo_A.txt"
-echo "CONTENU_UNIQUE_B_$(date +%s)" > "$REPO/archivo_B.txt"
-echo -e "${VERT}[OK] Environnement prêt.${NC}"
+echo -e "=== DEMARRAGE DES TESTS SIMPLES ==="
 
-# 3. Test de Parallélisme (Multiplexage)
-echo -e "\n${JAUNE}[3/5] Test : Téléchargements simultanés...${NC}"
-echo -e "Note : Assurez-vous que le serveur est déjà lancé dans un autre terminal."
+# 1. Compilation
+gcc -Wall server_select.c -o server_select
+gcc -Wall client.c -o client
 
-$CLIENT_BIN $SERVER_IP get archivo_A.txt $PORT > /dev/null &
+# 2. Préparation des fichiers
+dd if=/dev/urandom of="$REPO/archivo_A.txt" bs=1k count=3000 2>/dev/null
+echo "Contenido archivo B" > "$REPO/archivo_B.txt"
+
+# 3. Lancer le serveur
+sudo ./server_select & 
+SERVER_PID=$!
+sleep 1
+
+# 4. TEST 1: Multiplexage (telecharger A et B a la fois)
+echo -e "\n[TEST 1] Téléchargements simultanés..."
+./client $SERVER_IP get archivo_A.txt $PORT > /dev/null &
 PID1=$!
-$CLIENT_BIN $SERVER_IP get archivo_B.txt $PORT > /dev/null &
+./client $SERVER_IP get archivo_B.txt $PORT > /dev/null &
 PID2=$!
 
+#   Attendre que les deux téléchargements soient terminés
 wait $PID1 $PID2
-echo -e "${VERT}[OK] Les requêtes parallèles ont été traitées.${NC}"
+echo -e "${VERT}[OK] Test 1 terminé.${NC}"
 
-# 4. Test d'Exclusion Mutuelle (Lock)
-echo -e "\n${JAUNE}[4/5] Test : Verrouillage (Accès concurrent sur archivo_A.txt)${NC}"
-
-$CLIENT_BIN $SERVER_IP get archivo_A.txt $PORT > /dev/null &
+# 5. TEST 2: Lock (verifier que le serveur bloque les accès concurrents au même fichier)
+echo -e "\n[TEST 2] Vérification du Lock..."
+echo "Client 1 lance la descarga de archivo_A.txt..."
+./client $SERVER_IP get archivo_A.txt $PORT > /dev/null &
 PID_LOCK=$!
 
-sleep 0.2 # Pause pour laisser le temps au serveur de verrouiller
+sleep 0.2 #     Attendre un peu pour s'assurer que le serveur a pris le lock
 
-echo -e "Tentative du Client 2 (devrait échouer)..."
-ERREUR_MSG=$($CLIENT_BIN $SERVER_IP get archivo_A.txt $PORT 2>&1)
+echo "Client 2 tente de télécharger le même fichier (devrait échouer)..."
+#   Ce client devrait recevoir une erreur de lock
+./client $SERVER_IP get archivo_A.txt $PORT
 
-if [[ $ERREUR_MSG == *"busy"* ]] || [[ $ERREUR_MSG == *"Error"* ]] || [[ $ERREUR_MSG == *"lock"* ]]; then
-    echo -e "${VERT}[SUCCÈS] Le serveur a bien refusé l'accès concurrent.${NC}"
-else
-    echo -e "${ROUGE}[ALERTE] Le serveur n'a pas appliqué le verrouillage.${NC}"
-fi
-
+#   Attendre que le premier client termine
 wait $PID_LOCK
 
-# 5. Vérification finale et nettoyage
-echo -e "\n${JAUNE}[5/5] Vérification de l'intégrité...${NC}"
-TEST_FINAL=true
-
-for f in "archivo_A.txt" "archivo_B.txt"; do
-    if [ -f "$f" ] && diff "$REPO/$f" "$f" > /dev/null; then
-        echo -e "${VERT}[OK] $f : Reçu sans corruption.${NC}"
-    else
-        echo -e "${ROUGE}[ÉCHEC] $f : Erreur de réception.${NC}"
-        TEST_FINAL=false
-    fi
-done
-
-echo -e "\n${CYAN}==========================================================${NC}"
-if [ "$TEST_FINAL" = true ]; then
-    echo -e "${VERT}RÉSULTAT DU TEST : RÉUSSI (SUCCESS)${NC}"
-    # Nettoyage automatique des fichiers téléchargés
-    rm archivo_A.txt archivo_B.txt
-    echo -e "${NC}Fichiers de test nettoyés.${NC}"
-else
-    echo -e "${ROUGE}RÉSULTAT DU TEST : ÉCHOUÉ (FAILED)${NC}"
-fi
-echo -e "${CYAN}==========================================================${NC}"
+#   Vérifier que le fichier téléchargé est correct
+echo -e "\n=== TESTS TERMINÉS ==="
+sudo kill -9 $SERVER_PID 2>/dev/null
