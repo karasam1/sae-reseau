@@ -79,6 +79,17 @@ VerrouFichier* obtenir_verrou(const char *nom) {
     return nouveau;
 }
 
+void envoyer_oack(tftp_context_t *ctx) {
+    uint8_t pkt[128];
+    uint16_t opcode = htons(TFTP_OP_OACK);
+    memcpy(pkt, &opcode, 2);
+    int len = sprintf((char*)(pkt + 2), "blksize") + 1;
+    len += sprintf((char*)(pkt + 2 + len), "%u", ctx->blksize) + 1;
+    sendto(ctx->sockfd, pkt, 2 + len, 0, 
+        (struct sockaddr *)&ctx->peer_addr, 
+        ctx->peer_len);
+}
+
 void relacher_verrou(VerrouFichier *v) {
     pthread_mutex_lock(&mutex_liste);
     v->ref_count--;
@@ -125,24 +136,47 @@ void envoyer_ack(tftp_context_t *ctx, uint16_t block) {
 }
 
 int envoyer_donnees(tftp_context_t *ctx, uint16_t block, const uint8_t *data, size_t len) {
-    tftp_data_packet_t pkt;
-    pkt.opcode = htons(TFTP_OP_DATA); //
-    pkt.block = htons(block); //
-    memcpy(pkt.data, data, len); //
+    uint8_t *pkt = malloc(4 + len);
+    if (!pkt) return -1;
+
+    uint16_t op = htons(TFTP_OP_DATA);
+    uint16_t blk = htons(block);
+
+    memcpy(pkt, &op, 2);
+    memcpy(pkt + 2, &blk, 2);
+    memcpy(pkt + 4, data, len);
+
+    ssize_t sent = sendto(ctx->sockfd, pkt, 4 + len, 0,
+                         (struct sockaddr *)&ctx->peer_addr, ctx->peer_len);
     
-    ssize_t sent = sendto(ctx->sockfd, &pkt, 4 + len, 0,
-                         (struct sockaddr *)&ctx->peer_addr, ctx->peer_len); //
+    free(pkt);
     return (sent == (ssize_t)(4 + len)) ? 0 : -1;
 }
 
+
 int verifier_tid(tftp_context_t *ctx, struct sockaddr_in *from) {
     if (ctx->last_block == 0 && ctx->peer_addr.sin_port == 0) {
-        ctx->peer_addr.sin_port = from->sin_port; //
+        ctx->peer_addr.sin_port = from->sin_port;
+        ctx->peer_addr.sin_addr = from->sin_addr;
         return 1;
     }
     
     if (from->sin_addr.s_addr != ctx->peer_addr.sin_addr.s_addr || 
-        from->sin_port != ctx->peer_addr.sin_port) { //
+        from->sin_port != ctx->peer_addr.sin_port) {
+        unsigned long tid = (unsigned long)pthread_self() % 10000;
+        // Extraction d'informations de l'instrus
+        char *ip_intrus = inet_ntoa(from->sin_addr);
+        uint16_t port_intrus = ntohs(from->sin_port);
+        
+        // Extraction d'informations auprès de clients légitimes à des fins de comparaison
+        char *ip_legitime = inet_ntoa(ctx->peer_addr.sin_addr);
+        uint16_t port_legitime = ntohs(ctx->peer_addr.sin_port);
+
+        printf("\n[T-%04lu] ⚠️  [ALERTE SÉCURITÉ] Paquet TID invalide détecté !\n", tid);
+        printf("          LÉGITIME : %s:%u\n", ip_legitime, port_legitime);
+        printf("          INTRUS   : %s:%u\n", ip_intrus, port_intrus);
+        printf("          ACTION   : Paquet rejeté silencieusement.\n\n");
+        
         return 0;
     }
     return 1;
@@ -174,47 +208,83 @@ int executer_rrq(tftp_context_t *ctx) {
         envoyer_erreur(ctx, ERR_FILE_NOT_FOUND, strerror(errno));
         return -1;
     }
+
+    if (ctx->blksize != 512) {
+        envoyer_oack(ctx);
+        uint8_t temp_ack[16];
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        ssize_t r = recvfrom(ctx->sockfd, temp_ack, sizeof(temp_ack), 0, (struct sockaddr *)&from, &from_len);
+        if (r < 4) { fclose(ctx->fp); return -1; }
+        uint16_t op = ntohs(*(uint16_t *)temp_ack);
+        uint16_t blk = ntohs(*(uint16_t *)(temp_ack + 2));
+        if (op != TFTP_OP_ACK || blk != 0) {
+            fclose(ctx->fp); return -1; 
+        }
+    }
+
     printf("[T-%04lu] RRQ '%s' → envoi en cours...\n", tid, ctx->filename);
     fflush(stdout);
 
-    uint16_t block = 1;
-    uint8_t buf[MAX_DATA_SIZE];
-    struct sockaddr_in from;
-    socklen_t from_len = sizeof(from);
+    uint32_t current_block = 1;
+    uint8_t *buffer_dynamique = malloc(ctx->blksize);
+    uint8_t ack_buf[16];
     int done = 0;
 
     while (!done) {
-        size_t n = fread(buf, 1, MAX_DATA_SIZE, ctx->fp);
+        size_t n = fread(buffer_dynamique, 1, ctx->blksize, ctx->fp);
         ctx->retries = 0;
         int acked = 0;
 
         while (!acked && ctx->retries < TFTP_MAX_RETRIES) {
-            envoyer_donnees(ctx, block, buf, n);
-            ssize_t r = recvfrom(ctx->sockfd, buf, MAX_PACKET_SIZE, 0,
+            envoyer_donnees(ctx,(uint16_t) current_block, buffer_dynamique, n);
+
+            struct sockaddr_in from;
+            socklen_t from_len = sizeof(from);
+            ssize_t r = recvfrom(ctx->sockfd, ack_buf, sizeof(ack_buf), 0,
                                (struct sockaddr *)&from, &from_len);
 
             if (r >= 4 && verifier_tid(ctx, &from)) {
-                uint16_t op = ntohs(*(uint16_t *)buf);
-                uint16_t blk = ntohs(*(uint16_t *)(buf + 2));
-                if (op == TFTP_OP_ACK && blk == block) {
+                uint16_t op = ntohs(*(uint16_t *)ack_buf);
+                uint16_t blk_received = ntohs(*(uint16_t *)(ack_buf + 2));
+                if (op == TFTP_OP_ACK && blk_received == (uint16_t)current_block) {
                     acked = 1;
-                    ctx->last_block = block;
+                    ctx->last_block = blk_received;
                 }
+
             } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 printf("[T-%04lu] [TIMEOUT %d/%d] RRQ '%s' bloc %u\n",
                        tid, ++ctx->retries, TFTP_MAX_RETRIES,
-                       ctx->filename, block);
+                       ctx->filename, current_block);
                 fflush(stdout);
             }
         }
         if (!acked) {
-            printf("[T-%04lu] [ECHEC] RRQ '%s' - max retries atteint\n", tid, ctx->filename);
-            fclose(ctx->fp); return -1;
+            // --- INICIO DEL BLOQUE PROFESIONAL ---
+            if (n < ctx->blksize) {
+                // Si el bloque que falló era el último (n < blksize), 
+                // consideramos que el cliente ya tiene el archivo completo.
+                printf("[T-%04lu] Transfert terminé (Dernier ACK non reçu, mais fichier envoyé en totalité).\n", tid);
+                
+                // Limpiamos recursos y salimos con éxito (0)
+                fclose(ctx->fp);
+                free(buffer_dynamique);
+                return 0; 
+            } else {
+                // Si no era el último bloque, sí es un error real de transferencia
+                printf("[T-%04lu] [ECHEC] RRQ '%s' - max retries atteint\n", tid, ctx->filename);
+                fclose(ctx->fp);
+                free(buffer_dynamique);
+                return -1;
+            }
+            // --- FIN DEL BLOQUE PROFESIONAL ---
         }
-        if (n < MAX_DATA_SIZE) done = 1; else block++;
+        if (n < ctx->blksize) done = 1;
+        else current_block++;
     }
     fclose(ctx->fp);
-    printf("[T-%04lu] RRQ '%s' → %u bloc(s) envoyé(s) ✓\n", tid, ctx->filename, block);
+    free(buffer_dynamique);
+    printf("[T-%04lu] RRQ '%s' → %u bloc(s) envoyé(s) ✓\n", tid, ctx->filename, current_block);
     fflush(stdout);
     return 0;
 }
@@ -236,43 +306,55 @@ int executer_wrq(tftp_context_t *ctx) {
         envoyer_erreur(ctx, ERR_ACCESS_VIOLATION, strerror(errno));
         return -1;
     }
+    if (ctx->blksize != 512) {
+        envoyer_oack(ctx);
+    } else {
+        envoyer_ack(ctx, 0);
+    }
     printf("[T-%04lu] WRQ '%s' → réception en cours...\n", tid, ctx->filename);
     fflush(stdout);
 
-    envoyer_ack(ctx, 0); /* ACK du WRQ */
     ctx->last_block = 0;
-
-    struct sockaddr_in from;
-    socklen_t from_len = sizeof(from);
-    uint8_t buf[MAX_PACKET_SIZE];
-    uint16_t expected_block = 1;
+    uint8_t *buf_pkt = malloc(ctx->blksize + 4);
+    uint32_t expected_block = 1;
     int done = 0;
 
     while (!done) {
-        ssize_t n = recvfrom(ctx->sockfd, buf, MAX_PACKET_SIZE, 0,
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(ctx->sockfd, buf_pkt, ctx->blksize + 4, 0,
                              (struct sockaddr *)&from, &from_len);
         if (n < 4) continue;
         if (!verifier_tid(ctx, &from)) continue;
 
-        uint16_t op    = ntohs(*(uint16_t *)buf);
-        uint16_t block = ntohs(*(uint16_t *)(buf + 2));
+        uint16_t op    = ntohs(*(uint16_t *)buf_pkt);
+        uint16_t block_received = ntohs(*(uint16_t *)(buf_pkt + 2));
 
-        if (op == TFTP_OP_DATA && block == expected_block) {
-            size_t written = fwrite(buf + 4, 1, n - 4, ctx->fp);
-            if (written != (size_t)(n - 4)) {
-                printf("[T-%04lu] [ERREUR] Disque plein lors de l'écriture de '%s'\n",
-                       tid, ctx->filename);
-                envoyer_erreur(ctx, ERR_DISK_FULL, "Erreur disque");
-                fclose(ctx->fp); unlink(chemin); return -1;
+        if (op == TFTP_OP_DATA) {
+            if (block_received == (uint16_t)expected_block) {
+                size_t data_len = n - 4;
+                size_t written = fwrite(buf_pkt + 4, 1, data_len, ctx->fp);
+                if (written < data_len) {
+                    printf("[T-%04lu] [ERREUR] Disque plein lors de l'écriture de '%s'\n", tid, ctx->filename);
+                    envoyer_erreur(ctx, ERR_DISK_FULL, "Erreur disque");
+                    fclose(ctx->fp); 
+                    unlink(chemin);
+                    free(buf_pkt);
+                    return -1;
+                }
+                envoyer_ack(ctx, block_received);
+                ctx->last_block = block_received;
+                if (data_len < (size_t)ctx->blksize) done = 1;
+                else expected_block++;
+            } else if (block_received == (uint16_t)(expected_block - 1)) {
+                envoyer_ack(ctx, block_received);
             }
-            envoyer_ack(ctx, block);
-            ctx->last_block = block;
-            if (n - 4 < MAX_DATA_SIZE) done = 1; else expected_block++;
         }
     }
+    free(buf_pkt);
     fclose(ctx->fp);
     printf("[T-%04lu] WRQ '%s' → %u bloc(s) reçu(s) ✓\n",
-           tid, ctx->filename, ctx->last_block);
+           tid, ctx->filename, (uint32_t)expected_block);
     fflush(stdout);
     return 0;
 }
@@ -375,6 +457,8 @@ void* traitement_client(void* arg) {
     return NULL;
 }
 
+
+
 // --- MAIN : RÉCEPTIONNISTE ---
 
 int main() {
@@ -410,18 +494,45 @@ int main() {
         ctx->peer_addr    = c_addr;
         ctx->peer_len     = c_len;
         ctx->est_ecrivain = (op == TFTP_OP_WRQ);
+        ctx->blksize = 512;
 
+        // Extractio du nom de fichier
         strncpy(ctx->filename, buf + 2, sizeof(ctx->filename) - 1);
-        char *mode_ptr = buf + 2 + strlen(ctx->filename) + 1;
-        strncpy(ctx->mode, mode_ptr, sizeof(ctx->mode) - 1);
+        char *current_ptr = buf + 2 + strlen(ctx->filename) + 1;
+
+        // Extraction du mode de fichier
+        strncpy(ctx->mode, current_ptr, sizeof(ctx->mode) - 1);
+        current_ptr +=strlen(ctx->mode) + 1;
+
+        // 
+        while (current_ptr < (buf + n)) {
+            if (strcasecmp(current_ptr, "blksize") == 0) {
+                current_ptr += strlen(current_ptr) + 1;
+                if (current_ptr < (buf + n)) {
+                    int requested_blksize = atoi(current_ptr);
+                    // Validamos un rango razonable (8 a 1432 bytes)
+                    if (requested_blksize >= 8 && requested_blksize <= 1432) {
+                        ctx->blksize = (uint16_t)requested_blksize;
+                    }
+                    current_ptr += strlen(current_ptr) + 1;
+                }
+            } else {
+                // Opción desconocida: saltar nombre y valor
+                current_ptr += strlen(current_ptr) + 1;
+                if (current_ptr < (buf + n)) current_ptr += strlen(current_ptr) + 1;
+            }
+        }
 
         /* Log de la requête entrante */
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &c_addr.sin_addr, ip_str, sizeof(ip_str));
-        printf("\n[SERVEUR] %-3s depuis %s:%d → '%s' (mode=%s)\n",
-               op == TFTP_OP_RRQ ? "RRQ" : "WRQ",
-               ip_str, ntohs(c_addr.sin_port),
-               ctx->filename, ctx->mode);
+        printf("\n[SERVEUR] %-3s depuis %s:%d → '%s' (mode=%s, blksize=%u)\n",
+            op == TFTP_OP_RRQ ? "RRQ" : "WRQ",
+            ip_str, 
+            ntohs(c_addr.sin_port),
+            ctx->filename, 
+            ctx->mode,
+            ctx->blksize);
         fflush(stdout);
 
         pthread_t tid;

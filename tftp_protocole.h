@@ -5,19 +5,20 @@
 #include <netinet/in.h>
 #include <stdio.h>
 
-// --- CONSTANTES DU PROTOCOLE (RFC 1350) ---
-#define TFTP_PORT           69
-#define MAX_PACKET_SIZE     516    // 2 octets Opcode + 2 octets Block + 512 octets Data
-#define MAX_DATA_SIZE       512
-#define TFTP_TIMEOUT_SEC    5      // Délai avant retransmission
-#define TFTP_MAX_RETRIES    5      // Nombre max de tentatives
+#define MAX_PACKET_SIZE     1500  // Un poco más para estar seguros con opciones
+#define DEFAULT_BLKSIZE     512
+#define MAX_BLKSIZE         1432  // Para evitar fragmentación Ethernet
 
-// --- CODES D'OPÉRATION (OPCODES) ---
-#define TFTP_OP_RRQ   1  // Read Request
-#define TFTP_OP_WRQ   2  // Write Request
-#define TFTP_OP_DATA  3  // Data packet
-#define TFTP_OP_ACK   4  // Acknowledgment
-#define TFTP_OP_ERR   5  // Error packet
+#define TFTP_TIMEOUT_SEC    5
+#define TFTP_MAX_RETRIES    5
+
+// --- CODES D'OPÉRATION ---
+#define TFTP_OP_RRQ   1
+#define TFTP_OP_WRQ   2
+#define TFTP_OP_DATA  3
+#define TFTP_OP_ACK   4
+#define TFTP_OP_ERR   5
+#define TFTP_OP_OACK  6
 
 // --- STRUCTURES DES PAQUETS ---
 
@@ -25,7 +26,7 @@
 typedef struct {
     uint16_t opcode;
     uint16_t block;
-    uint8_t  data[MAX_DATA_SIZE];
+    uint8_t  data[DEFAULT_BLKSIZE];
 } __attribute__((packed)) tftp_data_packet_t;
 
 // Paquet ACK
@@ -50,9 +51,10 @@ typedef struct {
     char               filename[256];
     char               mode[32];     // Généralement "octet"
     FILE               *fp;          // Descripteur du fichier local
-    uint16_t           last_block;   // Numéro du dernier bloc acquitté
+    uint32_t           last_block;   // Numéro du dernier bloc acquitté
     int                retries;      // Compteur de retransmissions
     int                est_ecrivain; // 1 pour WRQ, 0 pour RRQ
+    uint32_t           blksize;
 } tftp_context_t;
 
 #endif // TFTP_PROTOCOLE_H
