@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <strings.h>
 #include "tftp_protocole.h"
 #include "tftp_errors.h"
 
@@ -31,12 +32,10 @@
  */
 typedef struct VerrouFichier {
     char nom_fichier[256];
-
     pthread_mutex_t mutex;         /* Protège nb_lecteurs et en_ecriture */
     pthread_cond_t  cond;          /* Réveille les threads en attente    */
     int nb_lecteurs;               /* Nombre de lecteurs actifs          */
     int en_ecriture;               /* 1 si un écrivain est actif         */
-
     int ref_count;                 /* Nb de threads utilisant ce verrou  */
     struct VerrouFichier *suivant;
 } VerrouFichier;
@@ -44,14 +43,16 @@ typedef struct VerrouFichier {
 VerrouFichier *liste_verrous = NULL;
 pthread_mutex_t mutex_liste = PTHREAD_MUTEX_INITIALIZER;
 
-/* ------------------------------------------------------------------
- * Recherche ou crée un verrou pour un fichier donné (opération atomique).
- * ------------------------------------------------------------------ */
+/**
+ * @brief Recherche ou crée un verrou pour un fichier donné (opération atomique).
+ * Gére la liste globale de verrous pour assurer l'integrité des fichiers.
+ */
 VerrouFichier* obtenir_verrou(const char *nom) {
+    // Section Critique: Accès à la lista globale des verrous.
     pthread_mutex_lock(&mutex_liste);
     VerrouFichier *courant = liste_verrous;
 
-    /* 1. Chercher un verrou existant */
+    /* 1. Recherche de verrou dans la liste chaînée. */
     while (courant) {
         if (strcmp(courant->nom_fichier, nom) == 0) {
             courant->ref_count++;
@@ -61,20 +62,25 @@ VerrouFichier* obtenir_verrou(const char *nom) {
         courant = courant->suivant;
     }
 
-    /* 2. Créer un nouveau verrou */
+    /* 2. Créer un nouveau verrou (Première access au fichier) */
+    // Si le fichier n'est pas dans ls liste, on alloue dynamiquement une structure de contrôle dediée.
     VerrouFichier *nouveau = malloc(sizeof(VerrouFichier));
     if (!nouveau) { pthread_mutex_unlock(&mutex_liste); return NULL; }
 
+    // Initialisation de mecanismes de synchronisation de verrou.
     memset(nouveau, 0, sizeof(VerrouFichier));
     strncpy(nouveau->nom_fichier, nom, sizeof(nouveau->nom_fichier) - 1);
+
+    // Mutex et variables de condition, indispensables pour implementer le modèle Lecteur/Rédacteur
     pthread_mutex_init(&nouveau->mutex, NULL);
     pthread_cond_init(&nouveau->cond, NULL);
     nouveau->nb_lecteurs  = 0;
     nouveau->en_ecriture  = 0;
     nouveau->ref_count    = 1;
-    nouveau->suivant      = liste_verrous;
+    nouveau->suivant      = liste_verrous; // Insertion en tête de liste.
     liste_verrous         = nouveau;
 
+    // Fin de la section critique globale
     pthread_mutex_unlock(&mutex_liste);
     return nouveau;
 }
@@ -108,7 +114,6 @@ void relacher_verrou(VerrouFichier *v) {
 }
 
 // --- FONCTIONS UTILITAIRES D'ERREUR ---
-
 void envoyer_erreur(tftp_context_t *ctx, uint16_t err_code, const char *msg) {
     tftp_error_packet_t pkt;
     pkt.opcode = htons(TFTP_OP_ERR); //
@@ -135,7 +140,19 @@ void envoyer_ack(tftp_context_t *ctx, uint16_t block) {
            (struct sockaddr *)&ctx->peer_addr, ctx->peer_len); //
 }
 
+
+/**
+ * @brief Construit et envoi un paquet DATA TFTP (Opcode 3)
+ * * @param ctx Contexte de la session (contient le socket et l'adresse du client).
+ * @param block Numéro de bloc de données actuel.
+ * @param data Pointeur vers les données brutes à envoyer.
+ * @param len Taille des données (doit être <= blksize)
+ * @return 0 en cas de succès, -1 en cas d'erreur d'allocation ou d'envoi.
+ */
 int envoyer_donnees(tftp_context_t *ctx, uint16_t block, const uint8_t *data, size_t len) {
+    // Allocation dynamique du paquet.
+    // La taille totale est de 4 octets d'en-tête (Opcode + block number)
+    // ajoutés à la taille des données utiles (Payload).
     uint8_t *pkt = malloc(4 + len);
     if (!pkt) return -1;
 
@@ -147,7 +164,8 @@ int envoyer_donnees(tftp_context_t *ctx, uint16_t block, const uint8_t *data, si
     memcpy(pkt + 4, data, len);
 
     ssize_t sent = sendto(ctx->sockfd, pkt, 4 + len, 0,
-                         (struct sockaddr *)&ctx->peer_addr, ctx->peer_len);
+        (struct sockaddr *)&ctx->peer_addr, 
+        ctx->peer_len);
     
     free(pkt);
     return (sent == (ssize_t)(4 + len)) ? 0 : -1;
@@ -190,26 +208,34 @@ char* construire_chemin_securise(char *buffer, size_t sz, const char *filename) 
     return buffer;
 }
 
-// --- OPÉRATIONS PRINCIPALES (RRQ / WRQ) ---
-
+/**
+ * @brief Gère une requête de lecture (RQ)
+ * Realise l'ouverture sécurisée du fichier, la négociation d'options (OACK)
+ * et le transfert par blocs avec gestion des acquittements (ACK).
+ */
 int executer_rrq(tftp_context_t *ctx) {
     unsigned long tid = (unsigned long)pthread_self() % 10000;
-    char chemin[512];
+    char chemin[DEFAULT_BLKSIZE];
+
+    // 1. Securisation de chemin d'accès. (Cela prévient les attaques de type 'Directory Traversal')
     if (!construire_chemin_securise(chemin, sizeof(chemin), ctx->filename)) {
         printf("[T-%04lu] [ERREUR] Chemin invalide : '%s'\n", tid, ctx->filename);
         envoyer_erreur(ctx, ERR_ACCESS_VIOLATION, "Chemin invalide");
         return -1;
     }
 
+    // 2. Ouverture du fichier source, en mode rb: Read Binary, pour garantir l'integrité des données 
+    // (mode octect RFC 1350).
     ctx->fp = fopen(chemin, "rb");
     if (!ctx->fp) {
         printf("[T-%04lu] [ERREUR] Fichier introuvable : '%s' (%s)\n",
-               tid, ctx->filename, strerror(errno));
+            tid, ctx->filename, strerror(errno));
         envoyer_erreur(ctx, ERR_FILE_NOT_FOUND, strerror(errno));
         return -1;
     }
 
-    if (ctx->blksize != 512) {
+    // 3. Negociation des options (RFC 2347/2348)
+    if (ctx->blksize != DEFAULT_BLKSIZE) {
         envoyer_oack(ctx);
         uint8_t temp_ack[16];
         struct sockaddr_in from;
@@ -221,7 +247,7 @@ int executer_rrq(tftp_context_t *ctx) {
         if (op != TFTP_OP_ACK || blk != 0) {
             fclose(ctx->fp); return -1; 
         }
-    }
+    }   
 
     printf("[T-%04lu] RRQ '%s' → envoi en cours...\n", tid, ctx->filename);
     fflush(stdout);
@@ -260,24 +286,17 @@ int executer_rrq(tftp_context_t *ctx) {
             }
         }
         if (!acked) {
-            // --- INICIO DEL BLOQUE PROFESIONAL ---
             if (n < ctx->blksize) {
-                // Si el bloque que falló era el último (n < blksize), 
-                // consideramos que el cliente ya tiene el archivo completo.
                 printf("[T-%04lu] Transfert terminé (Dernier ACK non reçu, mais fichier envoyé en totalité).\n", tid);
-                
-                // Limpiamos recursos y salimos con éxito (0)
                 fclose(ctx->fp);
                 free(buffer_dynamique);
                 return 0; 
             } else {
-                // Si no era el último bloque, sí es un error real de transferencia
                 printf("[T-%04lu] [ECHEC] RRQ '%s' - max retries atteint\n", tid, ctx->filename);
                 fclose(ctx->fp);
                 free(buffer_dynamique);
                 return -1;
             }
-            // --- FIN DEL BLOQUE PROFESIONAL ---
         }
         if (n < ctx->blksize) done = 1;
         else current_block++;
@@ -291,7 +310,7 @@ int executer_rrq(tftp_context_t *ctx) {
 
 int executer_wrq(tftp_context_t *ctx) {
     unsigned long tid = (unsigned long)pthread_self() % 10000;
-    char chemin[512];
+    char chemin[DEFAULT_BLKSIZE];
     if (!construire_chemin_securise(chemin, sizeof(chemin), ctx->filename)) {
         printf("[T-%04lu] [ERREUR] Chemin invalide : '%s'\n", tid, ctx->filename);
         envoyer_erreur(ctx, ERR_ACCESS_VIOLATION, "Chemin invalide");
@@ -306,7 +325,7 @@ int executer_wrq(tftp_context_t *ctx) {
         envoyer_erreur(ctx, ERR_ACCESS_VIOLATION, strerror(errno));
         return -1;
     }
-    if (ctx->blksize != 512) {
+    if (ctx->blksize != DEFAULT_BLKSIZE) {
         envoyer_oack(ctx);
     } else {
         envoyer_ack(ctx, 0);
@@ -363,16 +382,23 @@ int executer_wrq(tftp_context_t *ctx) {
 
 void* traitement_client(void* arg) {
     tftp_context_t *ctx = (tftp_context_t*)arg;
-    unsigned long tid = (unsigned long)pthread_self() % 10000;
-    pthread_detach(pthread_self());
 
-    /* 1. Socket dédiée à ce transfert (nouveau TID) */
+    // Generation d'un ID court pour identifier ce thread dans les logs
+    unsigned long tid = (unsigned long)pthread_self() % 10000;
+    pthread_detach(pthread_self()); // Detachemment de thread, liberation des ressources à sa terminaison.
+
+    /* 1. Creation du TID (transfert identifier) - RFC 1350 */
+    // Selon le standard, chaque transfert doit utiliser un nouveau port UDP pour
+    // liberer le port 69 et isoler les flux de données.
     ctx->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx->sockfd < 0) {
         printf("[T-%04lu] [ERREUR] Impossible de créer la socket TID\n", tid);
         free(ctx); return NULL;
     }
 
+    // Liaison à un port éphémère.
+    // En fixant sin_port à zero, l'OS choisit automatiquement un port libre.
+    // Ce nouveau port devient le TID officiel du serveur pour cette session.
     struct sockaddr_in serv_addr = {
         .sin_family      = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
@@ -383,10 +409,15 @@ void* traitement_client(void* arg) {
         close(ctx->sockfd); free(ctx); return NULL;
     }
 
+    // Configuration du délai d'attente.
+    // Essentiel pour la fiabilité TFTP: si le client ne repond pas.
+    // recvfrom() sortira en erreur après TFTP_TIMEOUT_SEC
     struct timeval tv = {TFTP_TIMEOUT_SEC, 0};
     setsockopt(ctx->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* 2. Obtenir le verrou associé au fichier */
+    /* 2. Gestion de l'exclusion mutuelle (File Locking) */
+    // Avant d'acceder au fichier, on récupère un verrou pour éviter
+    // pour eviter les conditions de concurrence (ex: deux clients écrivant dans le même fichier).
     VerrouFichier *v = obtenir_verrou(ctx->filename);
     if (!v) {
         printf("[T-%04lu] [ERREUR] Mémoire insuffisante (verrou)\n", tid);
@@ -437,7 +468,7 @@ void* traitement_client(void* arg) {
 
         v->nb_lecteurs++;
         printf("[T-%04lu] LECTURE '%s' : début (%d lecteur(s) actif(s))\n",
-               tid, ctx->filename, v->nb_lecteurs);
+            tid, ctx->filename, v->nb_lecteurs);
         pthread_mutex_unlock(&v->mutex);
 
         executer_rrq(ctx);
@@ -458,23 +489,34 @@ void* traitement_client(void* arg) {
 }
 
 
-
 // --- MAIN : RÉCEPTIONNISTE ---
-
 int main() {
-    mkdir(TFTP_ROOT, 0755);
+    // Initialisation de l'arborisation du serveur.
+    mkdir(TFTP_ROOT, 0755); // Creation de réportorie racine avec les droits 0755
+    
+    // Instantiation du socket de contrôle 
+    // IF_INET : Protocole IPV4
+    // SOCK_DIAGRAM : TFTP repose exlusivement sur UDP (RFC 1350)
     int sfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    // Configuration de l'addresse d'écoute.
+    // sin_port : Port 69 (port standard "Well-known" pour TFTP)
+    // sin_addr : INADDR_ANY accepte toutes les conexions sur toutes les interfaces réseau.
     struct sockaddr_in addr = {
         .sin_family      = AF_INET,
         .sin_port        = htons(69),
         .sin_addr        = {INADDR_ANY}
     };
-    bind(sfd, (struct sockaddr *)&addr, sizeof(addr));
+
+    // Liaison du socket à l'interface réseau.
+    bind(sfd, (struct sockaddr *)&addr, sizeof(addr)); // Note: L'éxecution sur le port 69 nécessite généralement des privilegies 'root' 
 
     printf("╔═══════════════════════════════════╗\n");
     printf("║  SERVEUR TFTP MULTITHREAD (69)    ║\n");
-    printf("║  Racine : %-25s║\n", TFTP_ROOT);
+    printf("║  Racine : %-24s║\n", TFTP_ROOT);
     printf("╚═══════════════════════════════════╝\n");
+    
+    // Force le vidage de sortie pour un long en temps réel.
     fflush(stdout);
 
     while(1) {
@@ -482,21 +524,32 @@ int main() {
         struct sockaddr_in c_addr;
         socklen_t c_len = sizeof(c_addr);
 
+        // Attente synchrone d'un datagrame UDP
+        // sfd : socket d'ecoute sur le port 69.
+        // c_addr : Capturera l'addresse IP et le port source du client (TID initial).
         int n = recvfrom(sfd, buf, MAX_PACKET_SIZE, 0,
                          (struct sockaddr*)&c_addr, &c_len);
+        
+        // Validation minimale du paquet
+        // Un paquet TFTP doit contenir au moins un opcode (2 octects).
+        // Un nom de fichier (min 1 octect) et un délimiteur nul
         if (n < 4) continue;
 
-        uint16_t op = ntohs(*(uint16_t*)buf);
+        // Analyse de l'Opcode (format réseau vers hôte)
+        uint16_t op = ntohs(*(uint16_t*)buf); // Seul requêtes RRQ et WRQ sont acceptes sur le port 69 (RFC 1350)
         if (op != TFTP_OP_RRQ && op != TFTP_OP_WRQ) continue;
 
+        // Allocation dynamique de le contexte de session.
+        // Chaque requête entrante génère un nouveau contexte 'ctx' pour isoler les donées
+        // de la session et permettre un traitement multithread sécurisé.
         tftp_context_t *ctx = malloc(sizeof(tftp_context_t));
         memset(ctx, 0, sizeof(tftp_context_t));
         ctx->peer_addr    = c_addr;
         ctx->peer_len     = c_len;
         ctx->est_ecrivain = (op == TFTP_OP_WRQ);
-        ctx->blksize = 512;
+        ctx->blksize = MAX_PACKET_SIZE;
 
-        // Extractio du nom de fichier
+        // Extraction du nom de fichier, utilisation du strcnpy pour prevenir des desbordements de tampon.
         strncpy(ctx->filename, buf + 2, sizeof(ctx->filename) - 1);
         char *current_ptr = buf + 2 + strlen(ctx->filename) + 1;
 
@@ -504,26 +557,29 @@ int main() {
         strncpy(ctx->mode, current_ptr, sizeof(ctx->mode) - 1);
         current_ptr +=strlen(ctx->mode) + 1;
 
-        // 
+        // Parsing des options d'extension (RFC 2347) 
         while (current_ptr < (buf + n)) {
+            // Recherche de l'option blksize (RFC 2348)
             if (strcasecmp(current_ptr, "blksize") == 0) {
                 current_ptr += strlen(current_ptr) + 1;
+
                 if (current_ptr < (buf + n)) {
                     int requested_blksize = atoi(current_ptr);
-                    // Validamos un rango razonable (8 a 1432 bytes)
-                    if (requested_blksize >= 8 && requested_blksize <= 1432) {
+
+                    // Validationn de la taille de bloc demandée.
+                    if (requested_blksize >= 8 && requested_blksize <= MAX_BLKSIZE) {
                         ctx->blksize = (uint16_t)requested_blksize;
                     }
                     current_ptr += strlen(current_ptr) + 1;
                 }
             } else {
-                // Opción desconocida: saltar nombre y valor
-                current_ptr += strlen(current_ptr) + 1;
-                if (current_ptr < (buf + n)) current_ptr += strlen(current_ptr) + 1;
+                // Option inconnue: Ignorer proprement.
+                // Selon le RFC 2347, si une option n'est pas suportée, 
+                // le serveur doit simplement l'ignorer et ne pas l'inclure dans l'OACK.
+                current_ptr += strlen(current_ptr) + 1; // Saute le clé
+                if (current_ptr < (buf + n)) current_ptr += strlen(current_ptr) + 1; // saute le valeur
             }
         }
-
-        /* Log de la requête entrante */
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &c_addr.sin_addr, ip_str, sizeof(ip_str));
         printf("\n[SERVEUR] %-3s depuis %s:%d → '%s' (mode=%s, blksize=%u)\n",

@@ -12,40 +12,65 @@
 
 // --- Fonctions Helper ---
 
+
+/**
+ * @brief: Envoie une requête RRQ/WRQ avec extension d'options (RFC 2347).
+ * * Construit un paquet TFTP client incluant l'opcode (RFC 1350), le nom du fichier,
+ * le mode de transfert, et l'option "blksize" pour la négotiation de la taille
+ * de bloc (RFC 2348).
+ * * @param ctx Le contexte de la session TFTP
+ * @param opcode_val L'opcode (1 pour RRQ, 2 pour WRQ)
+ */
 void send_request(tftp_context_t *ctx, uint16_t opcode_val) {
     char buffer[MAX_PACKET_SIZE];
+
+    // Positionnement de l'opcode (Format réseau) - 1350
     uint16_t *opcode = (uint16_t *)buffer;
     *opcode = htons(opcode_val);
     
     char *p = buffer + 2;
     
-    // Nom du fichier
+    // Copie du nom de fichier et du mode (Netascii, Octect, Mail)
+    // Note: Une vérification de la taille de ctx->filename est préconeisée ici.
     strcpy(p, ctx->filename);
     p += strlen(ctx->filename) + 1;
     
-    // Mode
     strcpy(p, ctx->mode);
     p += strlen(ctx->mode) + 1;
     
-    // Option Block Size
+    // Négociation de l'option Block Size - RFC 2347 & RFC 2348
+    // blksize permet de dépasser la limite par défaut de 512 octects.
     strcpy(p, "blksize");
     p += strlen("blksize") + 1;
-    sprintf(p, "%d", 1432); // Demande de 1432 pour éviter la fragmentation IP
+
+    // On demande une taille optimisée pour éviter la fragmentation IP
+    sprintf(p, "%d", MAX_BLKSIZE);
     p += strlen(p) + 1;
 
+    // Envoi du datagramme vers le serveur distant
     size_t len = p - buffer;
     sendto(ctx->sockfd, buffer, len, 0, (struct sockaddr *)&ctx->peer_addr, ctx->peer_len);
 }
 
+/**
+ * @brief Verifie l'identite del emetteur (TID) conformement au RFC 1350.
+ ** @param ctx Contexte actuel de la session TFTP.
+ * @param from Addresse source de paquet reçue.
+ * @return 1 si le TID es valide, sinon non.
+ */
 int verifier_tid(tftp_context_t *ctx, struct sockaddr_in *from) {
-    // Premier paquet : mise à jour du TID (port de réponse du serveur)
+    /* * 1. Phase de la capture du TID (Premier paquet)
+     * Enregistrer le port éphèmère choisi par le serveur
+    */
     if (ctx->last_block == 0 && (ntohs(ctx->peer_addr.sin_port) == 69 || ctx->peer_addr.sin_port == 0)) {
         ctx->peer_addr.sin_port = from->sin_port;
         return 1;
     }
     
+    // 2. Verification de la coherence de la source (Anti-Spoofing/Isolation)
     if (from->sin_addr.s_addr != ctx->peer_addr.sin_addr.s_addr || 
         from->sin_port != ctx->peer_addr.sin_port) {
+        // Journalisation de l'anomalie de sécurité/réseau.
         printf("  [ATTENTION] TID incorrect: %d attendu, %d reçu\n", 
                ntohs(ctx->peer_addr.sin_port), ntohs(from->sin_port));
         return 0;
@@ -76,29 +101,43 @@ void envoyer_erreur(tftp_context_t *ctx, uint16_t code, const char *msg) {
 
 // --- Opérations Principales ---
 
+
+/**
+ * @brief Implémente le transfert RRQ (Read Request) - RFC 1350 & 2347
+ * * Gére le cycle de vie du téléchargement:
+ * 1. Envoi une requête initiale.
+ * 2. Négociation des options (OACK).
+ * 3. Réception itérative de DATA et acquittement (ACK).
+ * 4. Gestion des rettransmissions pour le timeout.
+ * 5. Nettoyage et clotûre propre (Dallying).
+*/
 int tftp_get(tftp_context_t *ctx) {
+
+    // Ouverture du fichier local en mode "Write Binary" (WB)
     ctx->fp = fopen(ctx->filename, "wb");
     if (!ctx->fp) { perror("fopen"); return -1; }
 
-    ctx->blksize = 512;
+    // Initilisation des parametres de contrôle de flux
+    ctx->blksize = DEFAULT_BLKSIZE; // 512 par défaut (RFC 1350), sera mis à jour si un OACK est reçu.
     ctx->last_block = 0;
-    uint32_t expected_block = 1;
+    uint32_t expected_block = 1; // Le premier bloc de données est toujours le n°1.
     int done = 0;
     int success = 0;
 
     printf("[GET] Téléchargement de '%s'...\n", ctx->filename);
     
-    uint8_t *recv_buf = malloc(2048);
+    // Allocation du tampon de réception sur le tas (heap)
+    uint8_t *recv_buf = malloc(2048); // On alloue 2048 octects pour accueillir confortablement l'en-tête (4 octects)
+                                      // et les données (blksize jusqu'à 1432 octects), evitant tout depassement.
     if (!recv_buf) { fclose(ctx->fp); return -1; }
 
-    send_request(ctx, TFTP_OP_RRQ);
+    // Amorçage du protocole: Envoi du paquet Read Request (RRQ)
+    send_request(ctx, TFTP_OP_RRQ); // Construction du paquet avec l'opcode 1 et les options (RFC 2347)
     
     while (!done) {
         struct sockaddr_in from;
         socklen_t from_len = sizeof(from);
-
         ssize_t n = recvfrom(ctx->sockfd, recv_buf, 2048, 0, (struct sockaddr *)&from, &from_len);
-        
         if (n >= 4) {
             if (!verifier_tid(ctx, &from)) continue;
             
@@ -177,7 +216,6 @@ int tftp_get(tftp_context_t *ctx) {
         tftp_ack_packet_t final_ack = {htons(TFTP_OP_ACK), htons(ctx->last_block)};
         
         while (final_retries < 3) {
-            // Timeout corto de 500ms
             struct timeval tv_short = {0, 500000}; 
             setsockopt(ctx->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_short, sizeof(tv_short));
 
@@ -185,14 +223,12 @@ int tftp_get(tftp_context_t *ctx) {
             if (r >= 4) {
                 uint16_t opcode = ntohs(*(uint16_t *)recv_buf);
                 if (opcode == TFTP_OP_DATA) {
-                    // Si el servidor reenvía el último bloque, es que no recibió nuestro ACK
                     sendto(ctx->sockfd, &final_ack, 4, 0, (struct sockaddr *)&ctx->peer_addr, ctx->peer_len);
                     final_retries++;
                 } else {
                     break;
                 }
             } else {
-                // Si hay timeout (r < 0), asumimos que el servidor recibió el ACK y cerramos
                 break; 
             }
         }
@@ -250,7 +286,7 @@ int tftp_put(tftp_context_t *ctx) {
 
     // 2. PHASE DE CONNEXION (WRQ -> ACK 0 ou OACK)
     ctx->retries = 0;
-    ctx->blksize = 512; // Valeur par défaut si pas de négociation
+    ctx->blksize = DEFAULT_BLKSIZE; // Valeur par défaut si pas de négociation
 
     while (ctx->retries < TFTP_MAX_RETRIES) {
         send_request(ctx, TFTP_OP_WRQ); 
@@ -368,34 +404,49 @@ int tftp_put(tftp_context_t *ctx) {
     return 0;
 }
 
+
+/**
+ * @brief Point d'entrée du client TFTP (RFC 1350)
+ * * Gere l'initialisation du socket UDP, la configuration du timeout de reception.
+ * et l'affichage vers les operations de lecture (RRQ) ou d'écriture (WRQ).
+*/
 int main(int argc, char const *argv[]) {
+
+    // Vérification des arguments de la ligne de commande
     if (argc < 4) {
         printf("Usage: %s <ip> <get|put> <fichier> [port]\n", argv[0]);
         return 1;
     }
 
     tftp_context_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
+    memset(&ctx, 0, sizeof(ctx)); // Misé à zero pour eviter les données résiduels.
 
-    // Initialisation Contexte
+    // Creation du socket UDP
     ctx.sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    // Configuration du timeout pour éviter le blocage infini en cas de perte de paquet
     struct timeval tv = {TFTP_TIMEOUT_SEC, 0};
     setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    // Configuration de l'addresse de destination
     ctx.peer_addr.sin_family = AF_INET;
+    // Port 69 par défaut selon le standard, ou port personalisé
     ctx.peer_addr.sin_port = htons((argc == 5) ? atoi(argv[4]) : 69);
     inet_pton(AF_INET, argv[1], &ctx.peer_addr.sin_addr);
     ctx.peer_len = sizeof(ctx.peer_addr);
 
+    // Initialisation des paramètres de la requête
     strncpy(ctx.filename, argv[3], sizeof(ctx.filename) - 1);
-    strcpy(ctx.mode, "octet");
+    strcpy(ctx.mode, "octet"); // Mode binaire pour l'integrité des fichiers
     ctx.est_ecrivain = 0;
 
+    // Aiguillage vers la fonction spécifique (RFC 1350)
     if (strcmp(argv[2], "get") == 0) 
         tftp_get(&ctx);
     else if (strcmp(argv[2], "put") == 0) 
         tftp_put(&ctx);
 
+    // Liberation des ressources système
     close(ctx.sockfd);
     return 0;
 }

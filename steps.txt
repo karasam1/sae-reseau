@@ -1,0 +1,5 @@
+Dans autre terminal
+    sudo ./server
+
+Dans le present terminal
+    sudo ./test_tftp_bigfile.sh

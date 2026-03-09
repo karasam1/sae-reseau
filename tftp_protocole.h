@@ -5,9 +5,9 @@
 #include <netinet/in.h>
 #include <stdio.h>
 
-#define MAX_PACKET_SIZE     1500  // Un poco más para estar seguros con opciones
+#define MAX_PACKET_SIZE     1500
 #define DEFAULT_BLKSIZE     512
-#define MAX_BLKSIZE         1432  // Para evitar fragmentación Ethernet
+#define MAX_BLKSIZE         1432  // Pour eviter fragmentation ethernet
 
 #define TFTP_TIMEOUT_SEC    5
 #define TFTP_MAX_RETRIES    5
