@@ -20,6 +20,8 @@ echo "-------------------------------------------------------"
 # 1. Preparation: Creation d'un fichier volumineux sur le serveur
 echo -e "[1/4] Génération du fichier de ${FILE_SIZE_MB}MB..."
 mkdir -p "$SERVER_DIR"
+
+# Génération d'un fichier de 200 Mo rempli de données aléatoires
 dd if=/dev/urandom of="$SERVER_DIR/$FILE_NAME" bs=1M count=$FILE_SIZE_MB status=none
 
 # 2. Obtenez le hachage MD5 original

@@ -217,6 +217,13 @@ int executer_rrq(tftp_context_t *ctx) {
     unsigned long tid = (unsigned long)pthread_self() % 10000;
     char chemin[DEFAULT_BLKSIZE];
 
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    if (setsockopt(ctx->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt timeout");
+    }
+
     // 1. Securisation de chemin d'accès. (Cela prévient les attaques de type 'Directory Traversal')
     if (!construire_chemin_securise(chemin, sizeof(chemin), ctx->filename)) {
         printf("[T-%04lu] [ERREUR] Chemin invalide : '%s'\n", tid, ctx->filename);
@@ -257,7 +264,9 @@ int executer_rrq(tftp_context_t *ctx) {
     uint8_t ack_buf[16];
     int done = 0;
 
+// dans executer_rrq()
     while (!done) {
+        // Logique de detection
         size_t n = fread(buffer_dynamique, 1, ctx->blksize, ctx->fp);
         ctx->retries = 0;
         int acked = 0;
@@ -298,10 +307,10 @@ int executer_rrq(tftp_context_t *ctx) {
                 return -1;
             }
         }
-        if (n < ctx->blksize) done = 1;
+        if (n < ctx->blksize) done = 1; // Contidion de rupture
         else current_block++;
     }
-    fclose(ctx->fp);
+    fclose(ctx->fp); // Cloture de la Session
     free(buffer_dynamique);
     printf("[T-%04lu] RRQ '%s' → %u bloc(s) envoyé(s) ✓\n", tid, ctx->filename, current_block);
     fflush(stdout);
